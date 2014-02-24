@@ -19,10 +19,26 @@ import (
   "net/textproto"
   "strings"
   "strconv"
+  "time"
 )
 
-var bot *IRCBot
 var respReq *textproto.Reader
+
+
+const (
+  //Different commands the bot has
+  CMD_VOTE_UP = "!voteUp"
+  CMD_VOTE_DOWN = "!voteDown"
+  CMD_HELP = "!help"
+  CMD_VOTES = "!votes"
+
+  //Different errors the bot can throw
+  NO_USER_ERROR = "!No user specified!"
+  USER_NOT_FOUND_ERROR = "!User not in channel!"
+
+  //Different IRC reply numbers
+  NAME_REPLY = "353"
+)
 
 //Tried to add most of the commands into the bot
 //in order to keep from having too many globals.
@@ -35,24 +51,11 @@ type IRCBot struct {
   Channel     string
   Pass        string
   Votes       map[string]int
-  BotErrors   Errors
-  Cmds        Commands
+  Users       []string
+  Incomming   chan string
   Connection  net.Conn
 }
 
-//Different commands the bot has
-type Commands struct {
-  var CMD_VOTE_UP string = "!voteUp"
-  var CMD_VOTE_DOWN string = "!voteDown"
-  var CMD_HELP = "!help"
-  var CMD_VOTES = "!votes"
-}
-
-//Different errors the bot can throw
-type Errors struct {
-  var NO_USER_ERROR string = "!No user specified!"
-  var USER_NOT_FOUND_ERROR string = "!User not in channel!"
-}
 //create a new bot with the given server info
 //currently static but will create prompt for any server
 func createBot() *IRCBot {
@@ -64,6 +67,9 @@ func createBot() *IRCBot {
     Channel:    "#orderdeck",
     Pass:       "",
     Connection: nil,
+    Incomming:  make(chan string),
+    Votes:      make(map[string]int),
+    Users:      make([]string, 1),
     User:       "VoteBot",
     }
 }
@@ -73,61 +79,94 @@ func severPrompt() {
 }*/
 
 //connects the bot to the server & puts the connection in the bot
-func (bot *IRCBot) ServerConnect() (connection net.Conn, err error) {
-  connection, err = net.Dial("tcp", bot.Server + ":" + bot.Port)
+func (bot *IRCBot) ServerConnect() (err error) {
+  bot.Connection, err = net.Dial("tcp", bot.Server + ":" + bot.Port)
   if err != nil {
     log.Fatal("Unable to connect to the specified server", err)
+    return err
   }
-  log.Printf("Successfully connected to %s ($s)\n", bot.Server, bot.Connection.RemoteAddr())
-  return bot.Connection, nil
+  log.Printf("Successfully connected to %s (%s)\n", bot.Server, bot.Connection.RemoteAddr())
+  return nil
+}
+
+func (bot *IRCBot) listenToChannel() (err error) {
+  var line string
+  for {
+    line, err = respReq.ReadLine()
+    if err != nil {
+      break
+    }
+    fmt.Printf("\033[93m%s\n", line)
+    if(line != "") {
+      bot.Incomming <- line
+    }
+  }
+  return nil
 }
 
 //Starts the bot, initalizes votes to 0 & starts
 //a constant loop reading in lines & waiting for commands.
 func main() {
-  votes = make(map[string]int)
-  bot = createBot()
-  bot.Connection, _ = bot.ServerConnect()
-  sendCommand("USER", bot.Nick, "8 *", bot.Nick)
-  sendCommand("NICK", bot.Nick)
-  sendCommand("JOIN", bot.Channel)
-  defer connection.Close()
+  bot := createBot()
+  _ = bot.ServerConnect()
+  bot.sendCommand("USER", bot.Nick, "8 *", bot.Nick)
+  bot.sendCommand("NICK", bot.Nick)
+  bot.sendCommand("JOIN", bot.Channel)
+  defer bot.Connection.Close()
 
-  reader := bufio.NewReader(connection)
+  reader := bufio.NewReader(bot.Connection)
   respReq = textproto.NewReader(reader)
+  go bot.listenToChannel()
+  //specialListen <- "stop"
+  var waitStart time.Time
+  wait := false
   for {
-    line, err := respReq.ReadLine()
-    if err != nil {
-      break
+    line, available := <-bot.Incomming
+    if(!available) {
+      break;
     }
-    //Sends the PONG command in order not to get kicked from the server
-    fmt.Printf("\033[93m%s\n", line)
-      if strings.Contains(line, "PING") {
-        sendCommand("PONG", "")
+    if strings.Contains(line, "PING") {
+      bot.sendCommand("PONG", "")
+      time.Sleep(2 * time.Second)
+    }
+    if strings.Contains(line, NAME_REPLY) {
+      bot.setUsers(line)
+    }
+    if(!wait || (time.Now().Sub(waitStart).Seconds()>2)) {
+      wait=false
+      //Sends the PONG command in order not to get kicked from the server
+      if strings.Contains(line, bot.Channel) && strings.Contains(line, CMD_VOTE_UP) {
+        err := bot.voteUp(line)
+        if err != nil {
+          break
+        }
+        waitStart = time.Now()
+        wait = true;
       }
-    if strings.Contains(line, bot.Channel) && strings.Contains(line, CMD_VOTE_UP) {
-      err = voteUp(line)
-      if err != nil {
-        break
+      if strings.Contains(line, bot.Channel) && strings.Contains(line, CMD_VOTE_DOWN) {
+        err := bot.voteDown(line)
+        if err != nil {
+          break
+        }
+        waitStart = time.Now()
+        wait = true;
       }
-    }
-    if strings.Contains(line, bot.Channel) && strings.Contains(line, CMD_VOTE_DOWN) {
-      err = voteDown(line)
-      if err != nil {
-        break
+      if strings.Contains(line, bot.Channel) && strings.Contains(line, CMD_HELP) {
+        bot.help()
+        waitStart = time.Now()
+        wait = true;
       }
-    }
-    if strings.Contains(line, bot.Channel) && strings.Contains(line, CMD_HELP) {
-      help()
-    }
-    if strings.Contains(line, bot.Channel) && strings.Contains(line, CMD_VOTES) {
-      getVotes()
+      if strings.Contains(line, bot.Channel) && strings.Contains(line, CMD_VOTES) {
+        bot.getVotes()
+        waitStart = time.Now()
+        wait = true;
+      }
     }
   }
 }
 
 //Sends the specified command along with any parameters needed as well
-func sendCommand(command string, parameters ...string) {
+func (bot *IRCBot) sendCommand(command string, parameters ...string) {
   msg := strings.Join(parameters, " ")
   cmd := fmt.Sprintf("%s %s", command, msg)
   fmt.Fprintf(bot.Connection, strings.Join([]string{cmd, "\n"}, ""));
@@ -136,31 +175,32 @@ func sendCommand(command string, parameters ...string) {
 
 //Uses the sendCommand to PRIVMSG the channel 
 //as well as sends a []string message
-func sendMessage(recipient string, message ...string) {
+func (bot *IRCBot) sendMessage(recipient string, message ...string) {
   msg := fmt.Sprintf("%s : %s", recipient, strings.Join(message, " "))
-  sendCommand("PRIVMSG", msg)
+  bot.sendCommand("PRIVMSG", msg)
 }
 
 //Votes the user up & saves it to votes.
 //If the user isnt in the channel or isnt speicified it will complain
-func voteUp(line string) error {
+func (bot *IRCBot) voteUp(line string) error {
   commandLine := line[strings.Index(line, CMD_VOTE_UP):len(line)]
+  bot.sendCommand("NAMES", bot.Channel)
 
-   if strings.Index(line, CMD_VOTE_UP) != -1 {
+  if strings.Index(line, CMD_VOTE_UP) != -1 {
     commands := strings.Split(commandLine, " ")
     if len(commands) ==1 {
-      sendMessage(bot.Channel, "Error: ", NO_USER_ERROR)
+      bot.sendMessage(bot.Channel, "Error: ", NO_USER_ERROR)
     } else {
       voteUser := commands[1]
-      contained, err := inChannel(voteUser)
+      contained, err := bot.inChannel(voteUser)
       if err != nil {
         return err
       }
       if contained {
-        votes[voteUser] += 1
-        sendMessage(bot.Channel, "Upvoted:", voteUser)
+        bot.Votes[voteUser] += 1
+        bot.sendMessage(bot.Channel, "Upvoted:", voteUser)
       } else {
-        sendMessage(bot.Channel, "Error:", USER_NOT_FOUND_ERROR)
+        bot.sendMessage(bot.Channel, "Error:", USER_NOT_FOUND_ERROR)
       }
     }
   }
@@ -169,23 +209,24 @@ func voteUp(line string) error {
 
 //Votes the user down & saves it to votes.
 //If the user isnt in the channel or isnt speicified it will complain
-func voteDown(line string) error {
-commandLine := line[strings.Index(line, CMD_VOTE_DOWN):len(line)]
+func (bot *IRCBot) voteDown(line string) error {
+  commandLine := line[strings.Index(line, CMD_VOTE_DOWN):len(line)]
+  bot.sendCommand("NAMES", bot.Channel)
   if strings.Index(line, CMD_VOTE_DOWN) != -1 {
     commands := strings.Split(commandLine, " ")
     if len(commands) ==1 {
-      sendMessage(bot.Channel, "Error:", NO_USER_ERROR)
+      bot.sendMessage(bot.Channel, "Error:", NO_USER_ERROR)
     } else {
       voteUser := commands[1]
-      contained, err := inChannel(voteUser)
+      contained, err := bot.inChannel(voteUser)
       if err != nil {
         return err
       }
       if contained {
-        votes[voteUser] -= 1
-        sendMessage(bot.Channel, "Downvoted:", voteUser)
+        bot.Votes[voteUser] -= 1
+        bot.sendMessage(bot.Channel, "Downvoted:", voteUser)
       } else {
-        sendMessage(bot.Channel, "Error:", USER_NOT_FOUND_ERROR)
+        bot.sendMessage(bot.Channel, "Error:", USER_NOT_FOUND_ERROR)
       }
     }
   }
@@ -193,26 +234,53 @@ commandLine := line[strings.Index(line, CMD_VOTE_DOWN):len(line)]
 }
 
 //Prints a help menu to the channel
-func help() {
-  sendMessage(bot.Channel, "Commands are: \n")
-  sendMessage(bot.Channel, CMD_HELP)
-  sendMessage(bot.Channel, CMD_VOTE_UP)
-  sendMessage(bot.Channel, CMD_VOTE_DOWN)
-  sendMessage(bot.Channel, CMD_VOTES)
+func (bot *IRCBot) help() {
+  bot.sendMessage(bot.Channel, "Commands are:")
+  bot.sendMessage(bot.Channel, CMD_HELP)
+  bot.sendMessage(bot.Channel, CMD_VOTE_UP)
+  bot.sendMessage(bot.Channel, CMD_VOTE_DOWN)
+  bot.sendMessage(bot.Channel, CMD_VOTES)
 }
 
 //Gets the current list of votes and sends them to the
 //server
-func getVotes() {
-  sendMessage(bot.Channel, "Current votes are:")
-  for key, value := range votes {
-    sendMessage(bot.Channel, key, ":", strconv.Itoa(value))
+func (bot *IRCBot) getVotes() {
+  bot.sendMessage(bot.Channel, "Current votes are:")
+  for key, value := range bot.Votes {
+    bot.sendMessage(bot.Channel, key, ":", strconv.Itoa(value))
   }
 }
 
+
+func (bot *IRCBot) setUsers(line string) {
+  fmt.Printf("Got names, setting users\n")
+  nameLine := line[strings.Index(line, bot.Channel)+len(bot.Channel)+2:len(line)]
+  names := strings.Split(nameLine, " ")
+  for index, curName := range names {
+    if strings.HasPrefix(curName, "@") || strings.HasPrefix(curName, "+") {
+      names[index] = curName[1:len(curName)]
+    }
+  }
+  bot.Users = names
+  for index, curName := range bot.Users {
+    fmt.Printf("bot.Users[%d]=%s\n", index, curName)
+  }
+}
+
+//checks if the user listed is in the channel
+func (bot *IRCBot) inChannel(name string) (bool, error) {
+  for _, curName := range bot.Users {
+    if curName == name {
+      return true, nil
+    }
+  }
+  return false, nil
+}
+
+/*
 //Gets a list of the names in the channel and creates a []string from them
-func getNames() ([]string, error) {
-  sendCommand("NAMES", bot.Channel)
+func (bot *IRCBot) getNames() ([]string, error) {
+  bot.sendCommand("NAMES", bot.Channel)
   line, err := respReq.ReadLine()
   if err != nil {
     return nil, err
@@ -226,26 +294,15 @@ func getNames() ([]string, error) {
   }
   return names, nil
 }
+*/
 
-//checks if the user listed is in the channel
-func inChannel(name string) (bool, error) {
-  chanNames, err := getNames()
-  if err != nil {
-    return false, err
-  }
-  for _, curName := range chanNames {
-    if curName == name {
-      return true, nil
+/*
+func indexOf(value string, mySlice []string) int {
+  for index, curValue := range mySlice {
+    if curValue == value {
+      return index
     }
   }
-  return false, nil
+  return -1
 }
-
-// func indexOf(value string, mySlice []string) int {
-//   for index, curValue := range mySlice {
-//     if curValue == value {
-//       return index
-//     }
-//   }
-//   return -1
-// }
+*/
